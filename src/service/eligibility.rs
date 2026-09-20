@@ -87,6 +87,7 @@ mod tests {
             category: category.map(String::from),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             closed: false,
+            neg_risk: false,
         }
     }
 

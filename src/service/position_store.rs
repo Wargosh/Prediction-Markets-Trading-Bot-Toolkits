@@ -24,6 +24,7 @@ pub struct OpenPosition {
     pub take_profit_pct: f64,
     pub stop_loss_pct: f64,
     pub opened_at: DateTime<Utc>,
+    pub neg_risk: bool,
 }
 
 impl OpenPosition {
@@ -125,6 +126,7 @@ mod tests {
             take_profit_pct: 50.0,
             stop_loss_pct: 30.0,
             opened_at: Utc::now(),
+            neg_risk: false,
         }
     }
 
