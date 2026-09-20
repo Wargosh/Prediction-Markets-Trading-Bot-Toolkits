@@ -27,7 +27,6 @@
 
 use crate::config::AppConfig;
 use crate::service::{
-    clob::ClobClient,
     market_cache::MarketCache,
     midprice::{ClobMidpriceSource, MidpriceSource},
     onchain::{spawn_subscription, LogFilter, RawLog},

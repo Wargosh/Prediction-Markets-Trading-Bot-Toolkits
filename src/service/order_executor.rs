@@ -163,6 +163,7 @@ impl OrderExecutor {
             usd_notional: sizing.copy_usd,
             order_type,
             source_trade_hash: trade.tx_hash.clone(),
+            neg_risk: market.neg_risk,
         };
 
         let Some(clob) = self.clob.as_ref() else {
@@ -256,6 +257,7 @@ impl OrderExecutor {
             take_profit_pct: tp_pct,
             stop_loss_pct: sl_pct,
             opened_at: Utc::now(),
+            neg_risk: market.neg_risk,
         };
         self.positions.open(pos);
     }

@@ -22,6 +22,7 @@ pub struct MarketInfo {
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub closed: bool,
+    pub neg_risk: bool,
 }
 
 impl MarketInfo {
@@ -190,6 +191,14 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         _ => Vec::new(),
     };
 
+    // neg_risk detection: Gamma may provide this as a boolean field.
+    // If absent, default to false (standard CTF market).
+    let neg_risk = m
+        .get("negRisk")
+        .or_else(|| m.get("neg_risk"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(MarketInfo {
         slug,
         question,
@@ -198,5 +207,6 @@ fn parse_market(m: &serde_json::Value) -> Result<MarketInfo> {
         category,
         tags,
         closed,
+        neg_risk,
     })
 }

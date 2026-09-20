@@ -63,6 +63,7 @@ pub struct PlannedOrder {
     pub usd_notional: f64,
     pub order_type: OrderType,
     pub source_trade_hash: Option<String>,
+    pub neg_risk: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

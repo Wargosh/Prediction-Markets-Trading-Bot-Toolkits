@@ -51,6 +51,7 @@ pub enum SignatureType {
     Eoa = 0,
     PolyProxy = 1,
     PolyGnosisSafe = 2,
+    Poly1271 = 3,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,11 +118,12 @@ impl ClobClient {
             .context("parsing funder address")?;
 
         // If a funder is provided that differs from the signer, we're using a
-        // proxy/Safe; otherwise standard EOA signing.
+        // proxy/Safe; use POLY_1271 (signatureType=3) for deposit-wallet flows.
+        // Otherwise standard EOA signing.
         let signature_type = if funder == signer.address() {
             SignatureType::Eoa
         } else {
-            SignatureType::PolyProxy
+            SignatureType::Poly1271
         };
 
         Ok(Self {
@@ -177,7 +179,12 @@ impl ClobClient {
             signatureType: U256::from(self.signature_type as u8),
         };
 
-        let verifying_contract = Address::from_str(&self.exchange.ctf_exchange_address)?;
+        // V2: pick verifying contract by neg_risk flag.
+        let verifying_contract = if planned.neg_risk {
+            Address::from_str(&self.exchange.neg_risk_exchange_address)?
+        } else {
+            Address::from_str(&self.exchange.ctf_exchange_address)?
+        };
         let domain: Eip712Domain = eip712_domain! {
             name: self.exchange.domain_name.clone(),
             version: self.exchange.domain_version.clone(),

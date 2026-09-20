@@ -126,6 +126,7 @@ async fn monitor_once(
         usd_notional: pos.shares * limit_price,
         order_type: OrderType::Fak,
         source_trade_hash: None,
+        neg_risk: pos.neg_risk,
     };
 
     let signed = clob
@@ -176,6 +177,7 @@ mod tests {
             take_profit_pct: tp,
             stop_loss_pct: sl,
             opened_at: Utc::now(),
+            neg_risk: false,
         }
     }
 
