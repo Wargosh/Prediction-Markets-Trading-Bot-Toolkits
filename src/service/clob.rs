@@ -22,26 +22,27 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 sol! {
-    /// Polymarket CTF Exchange order — EIP-712 typed data.
+    /// Polymarket CTF Exchange V2 order — EIP-712 typed data.
     ///
-    /// NOTE: `side` and `signatureType` are encoded as `uint256` to match
-    /// Polymarket's on-chain `Order` struct. If you point at a fork that
-    /// declares them as `uint8`, narrow them here — the EIP-712 typehash
-    /// embeds the field types verbatim, so this MUST match the deployed
-    /// contract exactly or signatures will be rejected.
+    /// V2 changes (live April 28, 2026):
+    /// - Removed: taker, expiration, nonce, feeRateBps
+    /// - Changed: side and signatureType from uint256 → uint8
+    /// - Added: timestamp (ms), metadata, builder
+    ///
+    /// The EIP-712 typehash embeds field types verbatim, so this MUST match
+    /// the deployed V2 Exchange contract exactly or signatures will be rejected.
     struct Order {
         uint256 salt;
         address maker;
         address signer;
-        address taker;
         uint256 tokenId;
         uint256 makerAmount;
         uint256 takerAmount;
-        uint256 expiration;
-        uint256 nonce;
-        uint256 feeRateBps;
-        uint256 side;
-        uint256 signatureType;
+        uint8 side;
+        uint8 signatureType;
+        uint256 timestamp;
+        bytes32 metadata;
+        bytes32 builder;
     }
 }
 
@@ -59,7 +60,6 @@ pub struct SignedOrder {
     pub salt: String,
     pub maker: String,
     pub signer: String,
-    pub taker: String,
     #[serde(rename = "tokenId")]
     pub token_id: String,
     #[serde(rename = "makerAmount")]
@@ -67,12 +67,12 @@ pub struct SignedOrder {
     #[serde(rename = "takerAmount")]
     pub taker_amount: String,
     pub side: String,
-    pub expiration: String,
-    pub nonce: String,
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps: String,
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
+    pub timestamp: String,
+    pub metadata: String,
+    pub builder: String,
+    pub expiration: String,
     pub signature: String,
 }
 
@@ -100,7 +100,6 @@ pub struct ClobClient {
     signer: PrivateKeySigner,
     funder: Address,
     exchange: ExchangeConfig,
-    fee_rate_bps: u32,
     signature_type: SignatureType,
 
     api_key: Option<String>,
@@ -134,7 +133,6 @@ impl ClobClient {
             signer,
             funder,
             exchange: cfg.exchange.clone(),
-            fee_rate_bps: cfg.trading.fee_rate_bps,
             signature_type,
             api_key: cfg.credentials.api_key.clone(),
             api_secret: cfg.credentials.api_secret.clone(),
@@ -159,6 +157,10 @@ impl ClobClient {
         let (maker_amount, taker_amount) =
             usd_and_share_amounts(planned.shares, planned.limit_price, planned.side);
 
+        // V2: timestamp is order creation time in milliseconds (replaces nonce)
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
+
+        // V2: expiration still used in POST body for GTD, but not in signed struct
         let expiration = match order_type {
             OrderType::Gtc => 0u64,
             _ => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
@@ -168,15 +170,14 @@ impl ClobClient {
             salt: U256::from(rand::random::<u128>()),
             maker: self.funder,
             signer: self.signer.address(),
-            taker: Address::ZERO,
             tokenId: token_id_u256,
             makerAmount: maker_amount,
             takerAmount: taker_amount,
-            expiration: U256::from(expiration),
-            nonce: U256::ZERO,
-            feeRateBps: U256::from(self.fee_rate_bps),
-            side: U256::from(planned.side.as_u8()),
-            signatureType: U256::from(self.signature_type as u8),
+            side: planned.side.as_u8(),
+            signatureType: self.signature_type as u8,
+            timestamp: U256::from(timestamp),
+            metadata: B256::ZERO,
+            builder: B256::ZERO,
         };
 
         // V2: pick verifying contract by neg_risk flag.
@@ -202,15 +203,15 @@ impl ClobClient {
             salt: order.salt.to_string(),
             maker: format!("0x{:x}", order.maker),
             signer: format!("0x{:x}", order.signer),
-            taker: format!("0x{:x}", order.taker),
             token_id: order.tokenId.to_string(),
             maker_amount: order.makerAmount.to_string(),
             taker_amount: order.takerAmount.to_string(),
             side: side_str(planned.side).to_string(),
-            expiration: order.expiration.to_string(),
-            nonce: order.nonce.to_string(),
-            fee_rate_bps: order.feeRateBps.to_string(),
-            signature_type: self.signature_type as u8,
+            signature_type: order.signatureType,
+            timestamp: order.timestamp.to_string(),
+            metadata: format!("0x{}", hex::encode(order.metadata)),
+            builder: format!("0x{}", hex::encode(order.builder)),
+            expiration: expiration.to_string(),
             signature: format!("0x{}", hex::encode(sig.as_bytes())),
         })
     }
