@@ -160,8 +160,8 @@ impl ClobClient {
             usd_and_share_amounts(planned.shares, planned.limit_price, planned.side);
 
         let expiration = match order_type {
-            OrderType::Gtc => 0u64,
-            _ => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
+            OrderType::Gtd => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
+            _ => 0u64,  // FOK and GTC must have expiration = 0 (non-GTD requirement)
         };
 
         let order = Order {
