@@ -57,7 +57,8 @@ pub enum SignatureType {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SignedOrder {
-    pub salt: String,
+    #[serde(serialize_with = "serialize_salt_as_int")]
+    pub salt: u64,
     pub maker: String,
     pub signer: String,
     #[serde(rename = "tokenId")]
@@ -74,6 +75,13 @@ pub struct SignedOrder {
     pub builder: String,
     pub expiration: String,
     pub signature: String,
+}
+
+fn serialize_salt_as_int<S>(salt: &u64, ser: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    ser.serialize_u64(*salt)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,10 +174,19 @@ impl ClobClient {
             _ => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
         };
 
+        // Salt: bounded integer like official SDK (random * timestamp_ms)
+        let salt_u64 = generate_order_salt(timestamp);
+
+        // V2: For POLY_1271, signer is the funder (deposit wallet), not EOA
+        let order_signer = match self.signature_type {
+            SignatureType::Poly1271 => self.funder,
+            _ => self.signer.address(),
+        };
+
         let order = Order {
-            salt: U256::from(rand::random::<u128>()),
+            salt: U256::from(salt_u64),
             maker: self.funder,
-            signer: self.signer.address(),
+            signer: order_signer,
             tokenId: token_id_u256,
             makerAmount: maker_amount,
             takerAmount: taker_amount,
@@ -192,15 +209,25 @@ impl ClobClient {
             chain_id: self.exchange.chain_id,
             verifying_contract: verifying_contract,
         };
-        let digest: B256 = order.eip712_signing_hash(&domain);
-        let sig = self
-            .signer
-            .sign_hash(&digest)
-            .await
-            .context("signing order digest")?;
+        
+        // Sign the order with the appropriate method
+        let signature_hex = match self.signature_type {
+            SignatureType::Poly1271 => {
+                self.build_poly_1271_signature(&order, &domain).await?
+            }
+            _ => {
+                let digest: B256 = order.eip712_signing_hash(&domain);
+                let sig = self
+                    .signer
+                    .sign_hash(&digest)
+                    .await
+                    .context("signing order digest")?;
+                format!("0x{}", hex::encode(sig.as_bytes()))
+            }
+        };
 
         Ok(SignedOrder {
-            salt: order.salt.to_string(),
+            salt: salt_u64,
             maker: format!("0x{:x}", order.maker),
             signer: format!("0x{:x}", order.signer),
             token_id: order.tokenId.to_string(),
@@ -212,7 +239,7 @@ impl ClobClient {
             metadata: format!("0x{}", hex::encode(order.metadata)),
             builder: format!("0x{}", hex::encode(order.builder)),
             expiration: expiration.to_string(),
-            signature: format!("0x{}", hex::encode(sig.as_bytes())),
+            signature: signature_hex,
         })
     }
 
@@ -222,9 +249,16 @@ impl ClobClient {
         signed: SignedOrder,
         order_type: OrderType,
     ) -> Result<OrderResponse> {
+        // Owner must be the L2 api_key, not the funder address
+        let owner = self
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("L2 api_key required for posting orders"))?
+            .clone();
+        
         let body = OrderPostBody {
             order: signed,
-            owner: format!("0x{:x}", self.funder),
+            owner,
             order_type: order_type_str(order_type).to_string(),
         };
         let path = "/order";
@@ -283,6 +317,106 @@ impl ClobClient {
             ("POLY_PASSPHRASE", api_passphrase.clone()),
             ("Content-Type", "application/json".into()),
         ])
+    }
+}
+
+/// Generate a bounded salt value matching official SDK behavior:
+/// random * timestamp_ms, ensuring it fits in JavaScript's safe integer range.
+fn generate_order_salt(timestamp_ms: u64) -> u64 {
+    let random_fraction = rand::random::<f64>();
+    (random_fraction * (timestamp_ms as f64)) as u64
+}
+
+impl ClobClient {
+    /// Build POLY_1271 signature wrapper using Solady's TypedDataSign pattern.
+    /// This wraps the inner EIP-712 signature with additional fields required by
+    /// Polymarket's deposit wallet contract.
+    async fn build_poly_1271_signature(
+        &self,
+        order: &Order,
+        domain: &Eip712Domain,
+    ) -> Result<String> {
+        use alloy_primitives::keccak256;
+        use alloy_sol_types::SolValue;
+        
+        // Compute the EIP-712 struct hash for the Order
+        const ORDER_TYPE_STRING: &[u8] = b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+        let order_type_hash = keccak256(ORDER_TYPE_STRING);
+        
+        // Encode and hash the order struct fields individually
+        let mut order_encoded = Vec::new();
+        order_encoded.extend_from_slice(order_type_hash.as_slice());
+        order_encoded.extend_from_slice(&order.salt.abi_encode());
+        order_encoded.extend_from_slice(&order.maker.abi_encode());
+        order_encoded.extend_from_slice(&order.signer.abi_encode());
+        order_encoded.extend_from_slice(&order.tokenId.abi_encode());
+        order_encoded.extend_from_slice(&order.makerAmount.abi_encode());
+        order_encoded.extend_from_slice(&order.takerAmount.abi_encode());
+        order_encoded.extend_from_slice(&U256::from(order.side).abi_encode());
+        order_encoded.extend_from_slice(&U256::from(order.signatureType).abi_encode());
+        order_encoded.extend_from_slice(&order.timestamp.abi_encode());
+        order_encoded.extend_from_slice(order.metadata.as_slice());
+        order_encoded.extend_from_slice(order.builder.as_slice());
+        let contents_hash = keccak256(&order_encoded);
+        
+        // Build the domain separator for the CTF Exchange
+        let domain_type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+        let name_hash = keccak256(self.exchange.domain_name.as_bytes());
+        let version_hash = keccak256(self.exchange.domain_version.as_bytes());
+        
+        let mut domain_encoded = Vec::new();
+        domain_encoded.extend_from_slice(domain_type_hash.as_slice());
+        domain_encoded.extend_from_slice(name_hash.as_slice());
+        domain_encoded.extend_from_slice(version_hash.as_slice());
+        domain_encoded.extend_from_slice(&domain.chain_id.unwrap().abi_encode());
+        domain_encoded.extend_from_slice(&domain.verifying_contract.unwrap().abi_encode());
+        let app_domain_separator = keccak256(&domain_encoded);
+        
+        // Build the Solady TypedDataSign wrapper struct hash
+        const SOLADY_TYPE_STRING: &[u8] = b"TypedDataSign(Order contents,string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
+        let solady_type_hash = keccak256(SOLADY_TYPE_STRING);
+        let deposit_wallet_name_hash = keccak256(b"DepositWallet");
+        let deposit_wallet_version_hash = keccak256(b"1");
+        let deposit_wallet_salt = B256::ZERO;
+        
+        let mut solady_encoded = Vec::new();
+        solady_encoded.extend_from_slice(solady_type_hash.as_slice());
+        solady_encoded.extend_from_slice(contents_hash.as_slice());
+        solady_encoded.extend_from_slice(deposit_wallet_name_hash.as_slice());
+        solady_encoded.extend_from_slice(deposit_wallet_version_hash.as_slice());
+        solady_encoded.extend_from_slice(&domain.chain_id.unwrap().abi_encode());
+        solady_encoded.extend_from_slice(&order.signer.abi_encode()); // This is the deposit wallet (funder) for POLY_1271
+        solady_encoded.extend_from_slice(deposit_wallet_salt.as_slice());
+        let typed_data_sign_struct_hash = keccak256(&solady_encoded);
+        
+        // Compute the final digest
+        let mut digest_data = Vec::new();
+        digest_data.extend_from_slice(&[0x19, 0x01]);
+        digest_data.extend_from_slice(app_domain_separator.as_slice());
+        digest_data.extend_from_slice(typed_data_sign_struct_hash.as_slice());
+        let digest = keccak256(&digest_data);
+        
+        // Sign the digest with the EOA private key
+        let sig = self
+            .signer
+            .sign_hash(&digest)
+            .await
+            .context("signing POLY_1271 digest")?;
+        let inner_signature = hex::encode(sig.as_bytes());
+        
+        // Build the complete POLY_1271 signature:
+        // inner_sig + domain_separator + contents_hash + type_string + type_string_length
+        let contents_type = hex::encode(ORDER_TYPE_STRING);
+        let contents_type_len = format!("{:04x}", ORDER_TYPE_STRING.len());
+        
+        Ok(format!(
+            "0x{}{}{}{}{}",
+            inner_signature,
+            hex::encode(app_domain_separator),
+            hex::encode(contents_hash),
+            contents_type,
+            contents_type_len
+        ))
     }
 }
 
@@ -493,5 +627,50 @@ mod tests {
             hex::encode(mac),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
+    }
+
+    #[test]
+    fn test_salt_generation() {
+        // Salt should be bounded by timestamp_ms
+        let timestamp_ms = 1_000_000_000_000u64; // Example timestamp
+        let salt = generate_order_salt(timestamp_ms);
+        // Salt should be less than timestamp_ms
+        assert!(salt < timestamp_ms);
+        // Salt should be non-zero with high probability
+        assert!(salt > 0);
+    }
+
+    #[test]
+    fn test_salt_json_serialization() {
+        // Salt must serialize as JSON number, not string
+        let signed_order = SignedOrder {
+            salt: 123456789u64,
+            maker: "0x1234567890123456789012345678901234567890".to_string(),
+            signer: "0x1234567890123456789012345678901234567890".to_string(),
+            token_id: "12345".to_string(),
+            maker_amount: "1000000".to_string(),
+            taker_amount: "500000".to_string(),
+            side: "BUY".to_string(),
+            signature_type: 0,
+            timestamp: "1234567890000".to_string(),
+            metadata: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            builder: "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            expiration: "0".to_string(),
+            signature: "0x1234".to_string(),
+        };
+
+        let json = serde_json::to_string(&signed_order).unwrap();
+        // Verify salt is serialized as number, not string
+        assert!(json.contains("\"salt\":123456789"));
+        assert!(!json.contains("\"salt\":\"123456789\""));
+    }
+
+    #[test]
+    fn test_signature_type_values() {
+        // Verify signature type enum values match V2 spec
+        assert_eq!(SignatureType::Eoa as u8, 0);
+        assert_eq!(SignatureType::PolyProxy as u8, 1);
+        assert_eq!(SignatureType::PolyGnosisSafe as u8, 2);
+        assert_eq!(SignatureType::Poly1271 as u8, 3);
     }
 }

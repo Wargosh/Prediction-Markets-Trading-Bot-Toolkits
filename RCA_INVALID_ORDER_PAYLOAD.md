@@ -152,3 +152,224 @@ After fix:
 - Official py-clob-client-v2: https://github.com/Polymarket/py-clob-client-v2
 - Live evidence: `uploads/BRIEF_8d93.md`
 - Original V2 design: `uploads/2026-09-19-harrier-v2-patch-design_424b.md`
+
+---
+
+# Update: Second Round Fixes (2026-09-24)
+
+**Date**: 2026-09-24  
+**Status**: Additional issues identified and fixed
+
+## Context
+
+After PR #2 (branch `cursor/fix-v2-order-struct-3b81`) implemented the V2 Order struct changes above, live containers on image `harrier-polymarket-isolated:v0.2.1-v2-order-fix` **still** failed with:
+
+```
+CLOB rejected order (HTTP 400): {"error":"Invalid order payload"}
+```
+
+Example: ImJustKen ~2026-09-24T02:56:03Z whale BUY ~$75.28 → copy attempt still Invalid order payload.
+
+## Root Causes (Round 2)
+
+By comparing our implementation against the **official py-clob-client-v2** SDK, we found **four critical mismatches** that remained after the initial V2 struct fix:
+
+### 1. Salt Serialization ❌
+
+**Issue**: Salt was serialized as a JSON **string**, but CLOB V2 expects an **integer**.
+
+```rust
+// WRONG (PR #2):
+pub struct SignedOrder {
+    pub salt: String,  // ❌ Serialized as "12345678901234567890"
+    ...
+}
+
+// CORRECT (this fix):
+pub struct SignedOrder {
+    #[serde(serialize_with = "serialize_salt_as_int")]
+    pub salt: u64,     // ✅ Serialized as 12345678901234567890
+    ...
+}
+```
+
+**SDK Reference**: `py_clob_client_v2/order_utils/model/order_data_v2.py` line 60:
+```python
+"salt": int(order.salt),  # Must be integer, not string
+```
+
+The official SDK also bounds salt generation: `random.random() * timestamp_ms` to ensure it fits in JavaScript's safe integer range (2^53 - 1).
+
+### 2. V2 Order Signer Field for POLY_1271 ❌
+
+**Issue**: For `signatureType=3` (POLY_1271), the `signer` field in the signed order was set to the **EOA address**, but it must be the **funder** (deposit wallet) address.
+
+```rust
+// WRONG (PR #2):
+let order = Order {
+    maker: self.funder,
+    signer: self.signer.address(),  // ❌ Always EOA
+    ...
+};
+
+// CORRECT (this fix):
+let order_signer = match self.signature_type {
+    SignatureType::Poly1271 => self.funder,     // ✅ Deposit wallet for POLY_1271
+    _ => self.signer.address(),                  // ✅ EOA for other types
+};
+let order = Order {
+    maker: self.funder,
+    signer: order_signer,
+    ...
+};
+```
+
+**SDK Reference**: `py_clob_client_v2/order_builder/builder.py` lines 63-67:
+```python
+def _v2_order_signer(self) -> str:
+    if self.signature_type == SignatureTypeV2.POLY_1271:
+        return self.funder  # Use funder for POLY_1271
+    return self.signer.address()
+```
+
+### 3. POLY_1271 Signature Wrapper ❌
+
+**Issue**: For `signatureType=3`, we were signing the plain EIP-712 Order hash. But Polymarket's deposit wallet contract expects a **Solady TypedDataSign wrapper** that includes:
+- Inner EIP-712 signature
+- Domain separator
+- Contents hash
+- Type string
+- Type string length
+
+```rust
+// WRONG (PR #2):
+let digest: B256 = order.eip712_signing_hash(&domain);
+let sig = self.signer.sign_hash(&digest).await?;
+// ❌ Plain 65-byte signature
+
+// CORRECT (this fix):
+let signature_hex = match self.signature_type {
+    SignatureType::Poly1271 => {
+        self.build_poly_1271_signature(&order, &domain).await?
+        // ✅ Solady wrapper: sig + domain_sep + contents + type + len
+    }
+    _ => {
+        let digest: B256 = order.eip712_signing_hash(&domain);
+        let sig = self.signer.sign_hash(&digest).await?;
+        format!("0x{}", hex::encode(sig.as_bytes()))
+    }
+};
+```
+
+**SDK Reference**: `py_clob_client_v2/order_utils/exchange_order_builder_v2.py` lines 161-237:
+```python
+def _build_poly_1271_order_signature(self, typed_data: dict) -> str:
+    # Sign inner digest with EOA
+    contents_hash = ...
+    typed_data_sign_struct_hash = ...
+    digest = keccak(b"\x19\x01" + app_domain_separator + typed_data_sign_struct_hash)
+    signed = Account._sign_hash(digest, private_key=self.signer.private_key)
+    
+    # Build wrapper
+    return (
+        "0x"
+        + inner_signature
+        + app_domain_separator.hex()
+        + contents_hash.hex()
+        + contents_type
+        + contents_type_len
+    )
+```
+
+This signature format allows the deposit wallet contract to verify the EOA signature using EIP-1271.
+
+### 4. Owner Field in POST Body ❌
+
+**Issue**: The `owner` field in the order POST body was set to the **funder address**, but it must be the **L2 api_key**.
+
+```rust
+// WRONG (PR #2):
+let body = OrderPostBody {
+    order: signed,
+    owner: format!("0x{:x}", self.funder),  // ❌ Address
+    ...
+};
+
+// CORRECT (this fix):
+let owner = self.api_key.as_ref()
+    .ok_or_else(|| anyhow!("L2 api_key required"))?
+    .clone();
+let body = OrderPostBody {
+    order: signed,
+    owner,  // ✅ API key string
+    ...
+};
+```
+
+**SDK Reference**: `py_clob_client_v2/client.py`:
+```python
+owner = self.creds.api_key or ""
+order_payload = order_to_json_v2(order, owner, order_type, ...)
+```
+
+## Changes Implemented
+
+**File**: `src/service/clob.rs`
+
+1. ✅ Changed `SignedOrder.salt` from `String` to `u64` with custom serializer
+2. ✅ Added `generate_order_salt(timestamp_ms)` helper (bounded like official SDK)
+3. ✅ Fixed `order.signer` to use funder for POLY_1271, EOA for others
+4. ✅ Implemented `build_poly_1271_signature()` with full Solady wrapper
+5. ✅ Fixed `owner` in POST body to use `api_key` instead of funder address
+6. ✅ Added unit tests for salt generation, JSON serialization, and signature types
+
+## Test Coverage
+
+New tests added to `src/service/clob.rs`:
+
+```rust
+#[test]
+fn test_salt_generation() { ... }           // Verify bounded salt generation
+
+#[test]
+fn test_salt_json_serialization() { ... }   // Verify salt as JSON number
+
+#[test]
+fn test_signature_type_values() { ... }     // Verify enum values match V2 spec
+```
+
+All tests pass: `cargo +nightly test --lib clob`
+
+## Verification Path
+
+1. ✅ Code compiles without errors
+2. ✅ All unit tests pass
+3. 🔲 Build Docker image from this branch
+4. 🔲 Deploy in dry-run mode
+5. 🔲 Verify signed order structure matches official SDK output
+6. 🔲 Confirm CLOB accepts orders (HTTP 200 with orderID)
+7. 🔲 Enable live trading on small test
+
+## Why These Were Not Caught Initially
+
+1. **Salt serialization**: JSON wire format differs from Rust types. Without comparing actual POST body to official SDK, the `to_string()` serialization looked correct.
+
+2. **POLY_1271 signer field**: The deposit-wallet flow is uncommon. Most examples use EOA direct signing (signatureType=0).
+
+3. **POLY_1271 signature wrapper**: This is specific to Polymarket's deposit wallet implementation using Solady's TypedDataSign pattern. Standard EIP-712 examples don't show this.
+
+4. **Owner field**: The field name "owner" suggested the wallet address, but Polymarket uses it as the L2 API credential identifier.
+
+All four issues only manifest with:
+- Live CLOB POST requests (not just event detection)
+- Deposit wallet setup (funder ≠ signer)
+- Actual HTTP 400 error debugging
+
+## Impact
+
+These fixes complete the V2 migration. The bot should now:
+- ✅ Generate compliant V2 signed orders
+- ✅ POST successfully to CLOB V2 endpoints
+- ✅ Support deposit-wallet (POLY_1271) flows
+
+Next step: Docker rebuild + dry-run validation before live promotion.
