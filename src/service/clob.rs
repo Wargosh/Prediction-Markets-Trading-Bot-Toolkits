@@ -169,6 +169,7 @@ impl ClobClient {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
 
         // V2: expiration still used in POST body for GTD, but not in signed struct
+        // Only GTD orders have non-zero expiration; FOK/GTC must be 0
         let expiration = match order_type {
             OrderType::Gtd => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
             _ => 0u64,  // FOK and GTC must have expiration = 0 (non-GTD requirement)
