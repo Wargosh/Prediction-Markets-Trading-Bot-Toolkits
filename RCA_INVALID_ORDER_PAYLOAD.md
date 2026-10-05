@@ -373,3 +373,94 @@ These fixes complete the V2 migration. The bot should now:
 - ✅ Support deposit-wallet (POLY_1271) flows
 
 Next step: Docker rebuild + dry-run validation before live promotion.
+
+---
+
+# Update: Round 3 - Expiration Logic Fix (2026-10-05)
+
+**Date**: 2026-10-05  
+**Status**: Final fix applied
+
+## Context
+
+After implementing Round 1 (V2 Order struct) and Round 2 (POLY_1271 fixes), we discovered that PR #2 (`cursor/fix-v2-order-struct-3b81`) had **inverted expiration logic** that was introduced during the initial V2 fixes.
+
+## Root Cause
+
+**PR #2 branch had wrong expiration logic**:
+```rust
+let expiration = match order_type {
+    OrderType::Gtc => 0u64,                           // ✅ Correct
+    _ => timestamp,                                   // ❌ WRONG - includes FOK!
+};
+```
+
+This means:
+- GTC → 0 (correct)
+- GTD → timestamp (correct)
+- **FOK → timestamp (WRONG!)** ← Should be 0
+
+**Correct logic** (from PR #3 merged to main):
+```rust
+let expiration = match order_type {
+    OrderType::Gtd => timestamp,                      // ✅ Only GTD is non-zero
+    _ => 0u64,                                        // ✅ FOK and GTC are 0
+};
+```
+
+## Why This Matters
+
+Per [Polymarket V2 migration docs](https://docs.polymarket.com/v2-migration):
+- `expiration` is NOT part of the EIP-712 signed struct in V2
+- It IS still present in the POST body for GTD/order-expiry handling
+- **FOK/GTC/IOC orders must have expiration=0**
+- Only GTD orders may have non-zero expiration
+
+The CLOB validates the POST body and rejects orders where FOK has a non-zero expiration.
+
+## Fix Applied
+
+**Branch**: `cursor/v2-complete-fix-43ac` (new branch from PR #2 + expiration fix)
+
+**File**: `src/service/clob.rs` lines 171-176
+
+```rust
+// V2: expiration still used in POST body for GTD, but not in signed struct
+// Only GTD orders have non-zero expiration; FOK/GTC must be 0
+let expiration = match order_type {
+    OrderType::Gtd => (chrono::Utc::now().timestamp() as u64).saturating_add(expiration_secs),
+    _ => 0u64,  // FOK and GTC must have expiration = 0 (non-GTD requirement)
+};
+```
+
+This aligns with:
+1. Official Polymarket V2 API spec
+2. PR #3 fix that was merged to main
+3. Official py-clob-client-v2 SDK behavior
+
+## Verification
+
+✅ All unit tests pass  
+✅ Code compiles successfully  
+✅ Matches official SDK logic  
+✅ Aligns with V2 migration documentation  
+
+## Summary of All Three Rounds
+
+### Round 1: V2 Order Struct
+- Fixed EIP-712 typehash (V1 → V2 struct)
+- Removed: taker, nonce, feeRateBps fields
+- Added: timestamp, metadata, builder fields
+- Changed: side/signatureType from uint256 to uint8
+
+### Round 2: POLY_1271 Wire Format
+- Salt as JSON integer (not string)
+- Order signer = funder for POLY_1271 (not EOA)
+- POLY_1271 signature wrapper (Solady TypedDataSign)
+- Owner = api_key in POST body (not funder address)
+
+### Round 3: Expiration Logic
+- GTD → timestamp (only GTD is non-zero)
+- FOK/GTC → 0 (all other order types)
+
+All three were required for complete V2 compliance.
